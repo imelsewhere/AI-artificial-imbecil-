@@ -244,6 +244,9 @@ def _writer_prompt(
         "Разрешено только: извлекать и структурировать. НЕ сжимай смысл: сохраняй все существенные детали.\n"
         "Не переписывай документ целиком, но сохраняй семантические блоки (разделы/подразделы/списки/инструкции) и порядок внутри блока.\n"
         "В заголовках и описании карточек обязательно отражай конкретный объект/инструмент из документа/имени файла (например SmartView), не пиши общие формулировки.\n"
+        "Важно: карточек может быть МНОГО, если документ большой и содержит разные смысловые блоки.\n"
+        "Ключевое правило: НЕ повторяй одну и ту же информацию в разных карточках. Каждый факт/инструкция/список должен жить в ОДНОЙ, "
+        "самой подходящей карточке. Если нужно упомянуть связь — сделай короткую ссылку 'см. карточку <название>' вместо копипаста.\n"
         "Рекомендация по СМЫСЛОВЫМ типам информации (это не шаблон и не обязательные названия секций, а ориентир что покрывать):\n"
         "- инструкции/процедуры/шаги\n"
         "- инструменты/утилиты/сервисы\n"
@@ -255,11 +258,11 @@ def _writer_prompt(
         "Запрещено писать в карточке мета-текст и оценку качества, например: "
         "'требует дополнительного пояснения', 'нужно подробнее описать', 'недостаточно информации'. "
         "Если в документе деталей нет — просто НЕ добавляй их.\n"
-        "Важно: карточек может быть НЕСКОЛЬКО.\n"
+        "Важно: карточек может быть несколько или много.\n"
         "Ключевое правило: НЕ делай по одной карточке на каждый пункт списка/каждый инструмент, если их много.\n"
         "Если документ — это обзор/перечень однотипных сущностей (инструменты, библиотеки, участники, ссылки) — сделай 1 карточку-обзор,\n"
         "где внутри будут подпункты по всем элементам (очень кратко), и при необходимости вторую карточку (например, 'Инструкция').\n"
-        "Обычно достаточно 1–2 карточек на документ. Делай больше только если информации реально много.\n"
+        "Обычно достаточно 1-6 карточек на документ, но делай больше, если информации реально много и она распадается на разные темы.\n"
         "Карточка должна быть самодостаточной.\n\n"
         "Верни результат СТРОГО в JSON формате.\n\n"
         "Правила:\n"
@@ -282,19 +285,72 @@ def _judge_prompt(*, origin_rel_path: str, doc_text: str, cards_json: str) -> st
     """
     return (
         "Ты судья качества разбиения документа на карточки знаний.\n"
-        f"Вот название документа (имя файла): {origin_rel_path}\n"
-        "Это имя относится к текущему документу-источнику и задаёт контекст (о каком конкретно инструменте/системе/теме документ).\n"
-        "Проверь: все ли важные знания из документа отражены в карточках.\n"
+        f"Название документа (имя файла): {origin_rel_path}\n\n"
+        "У тебя есть ДВА входа:\n"
+        "- ORIGINAL DOCUMENT: исходный текст. Это ЕДИНСТВЕННЫЙ источник истины.\n"
+        "- CARDS_JSON: сгенерированные карточки, которые надо проверить.\n\n"
+        "Проверь: отражены ли ВСЕ важные знания из ORIGINAL DOCUMENT в CARDS_JSON.\n"
         "Важно: карточки должны быть по смыслу (атомарные знания), не обязаны повторять структуру документа.\n"
-        "Также проверь, что карточки НЕ слишком раздроблены: если много однотипных мелких карточек, предложи объединить в 1–2 обзорные.\n"
-        "Если не всё покрыто — перечисли недостающие знания максимально конкретно и ОБЯЗАТЕЛЬНО приложи цитату из документа как доказательство.\n"
-        "Запрещено требовать информацию, которой нет в документе (не придумывай 'что надо бы добавить', если этого нет в тексте).\n\n"
+        "Также проверь, что карточки НЕ слишком раздроблены: если много однотипных мелких карточек, предложи объединить в 1–2 обзорные.\n\n"
+        "КРИТИЧЕСКОЕ ПРАВИЛО ПРО missing:\n"
+        "- Ты имеешь право добавить пункт в missing ТОЛЬКО если можешь привести ДОСЛОВНУЮ цитату из ORIGINAL DOCUMENT.\n"
+        "- Поле missing[].evidence должно быть точной подстрокой из ORIGINAL DOCUMENT (не пересказом).\n"
+        "- Если ты не можешь привести дословную цитату — НЕ добавляй этот пункт в missing.\n"
+        "- Запрещено требовать информацию, которой нет в ORIGINAL DOCUMENT.\n\n"
         "Верни результат СТРОГО в JSON формате.\n\n"
-        "Документ (если длинный — оценка по ключевым пунктам/сущностям/ссылкам):\n\n"
-        f"{doc_text[:15000]}\n\n"
-        "Карточки:\n\n"
+        "=== ORIGINAL DOCUMENT (source of truth) ===\n"
+        f"{doc_text[:15000]}\n"
+        "=== END ORIGINAL DOCUMENT ===\n\n"
+        "=== CARDS_JSON (to evaluate) ===\n"
         f"{cards_json}\n"
+        "=== END CARDS_JSON ===\n"
     )
+
+
+def _normalize_ws(s: str) -> str:
+    return " ".join((s or "").split())
+
+
+def _sanitize_judge_meta(*, doc_text: str, judge_meta: dict[str, Any]) -> dict[str, Any]:
+    """
+    Защита от галлюцинаций судьи:
+    - оставляем missing только если evidence действительно встречается в doc_text (после нормализации пробелов)
+    - если судья сказал ok=false, но после фильтрации missing пустой — считаем ok=true
+    """
+    if not isinstance(judge_meta, dict):
+        return {"ok": False, "missing": ["judge_meta_not_a_dict"], "suggested_card_titles": []}
+
+    missing_in = judge_meta.get("missing") or []
+    if not isinstance(missing_in, list):
+        missing_in = []
+
+    doc_norm = _normalize_ws(doc_text)
+
+    kept: list[Any] = []
+    removed_count = 0
+    for item in missing_in:
+        if isinstance(item, dict):
+            ev = str(item.get("evidence", "") or "").strip()
+            if ev and _normalize_ws(ev) in doc_norm:
+                kept.append(item)
+            else:
+                removed_count += 1
+        else:
+            # строковые missing (например при parse_error) оставляем как есть
+            kept.append(item)
+
+    out = dict(judge_meta)
+    out["missing"] = kept
+    if removed_count:
+        out["missing_sanitized_removed"] = removed_count
+
+    # Если судья ругался только "без цитаты" — после фильтрации считаем, что всё ок.
+    ok_val = bool(out.get("ok", False))
+    if not ok_val and (not kept) and isinstance(judge_meta.get("missing"), list):
+        out["ok"] = True
+        out["ok_sanitized_overridden"] = True
+
+    return out
 
 
 def _generate_cards_once(
@@ -359,74 +415,6 @@ def _cards_have_generation_error(cards: list[dict[str, Any]]) -> bool:
             return True
     return False
 
-
-def _looks_like_list_overview(md_text: str) -> bool:
-    """
-    Хелпер: документ похож на "обзор/перечень" если много однотипных блоков (#### ...)
-    или много буллетов.
-    """
-    lines = md_text.splitlines()
-    h4 = sum(1 for l in lines if l.strip().startswith("#### "))
-    bullets = sum(1 for l in lines if l.strip().startswith(("-", "•", "o ", "* ")))
-    return h4 >= 4 or bullets >= 10
-
-
-def _should_merge_to_overview(origin_rel_path: str, md_text: str, raw_cards: list[dict[str, Any]]) -> bool:
-    """
-    Принятие решения об объединении.
-    - обзорные/списочные документы почти всегда должны давать 1-2 карточки
-    - короткие орг-документы (цели/задачи/контакты) тоже лучше 1 карточкой
-    """
-    if len(raw_cards) <= 2:
-        return False
-    text_len = len(md_text)
-    stem = Path(origin_rel_path).stem.lower()
-    if _looks_like_list_overview(md_text) and len(raw_cards) > 2:
-        return True
-    # короткий документ, но модель раздробила на много карточек -> склеиваем
-    if text_len < 8000 and len(raw_cards) >= 4:
-        return True
-    # орг-доки про ЦК обычно нужны 1 карточкой
-    if ("цк" in stem or "участник" in stem or "сотрудник" in stem) and text_len < 15000 and len(raw_cards) > 2:
-        return True
-    return False
-
-
-def _merge_cards_to_overview(origin_rel_path: str, raw_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Объединяет много мелких карточек в 1 обзорную (как в ваших примерах).
-    """
-    if not raw_cards:
-        return raw_cards
-    doc_title = Path(origin_rel_path).stem.replace("_", " ").strip()
-    # Берём первые 1-2 описания, чтобы составить краткое.
-    desc_parts = [str(c.get("description", "")).strip() for c in raw_cards if str(c.get("description", "")).strip()]
-    desc = desc_parts[0] if desc_parts else f"Документ содержит информацию о {doc_title}."
-    if not desc.lower().startswith("документ содержит информацию о"):
-        desc = f"Документ содержит информацию о {desc.rstrip('.') }."
-
-    blocks = []
-    for c in raw_cards:
-        t = str(c.get("title", "")).strip()
-        body = str(c.get("content_md", "")).strip()
-        if not t and not body:
-            continue
-        if t:
-            blocks.append(f"#### {t}\n{body}".strip())
-        else:
-            blocks.append(body)
-    content_md = "\n\n".join(blocks).strip()
-    return [
-        {
-            "title": doc_title,
-            "description": desc,
-            "content_md": content_md,
-            "key_terms": sorted({x for c in raw_cards for x in (c.get("key_terms") or []) if str(x).strip()}),
-            "entities": sorted({x for c in raw_cards for x in (c.get("entities") or []) if str(x).strip()}),
-        }
-    ]
-
-
 def kb_upsert_cards_for_markdown(ctx: ToolContext, origin_rel_path: str, force: bool = False) -> dict[str, Any]:
     if not origin_rel_path:
         raise ValueError("origin_rel_path is required")
@@ -485,6 +473,7 @@ def kb_upsert_cards_for_markdown(ctx: ToolContext, origin_rel_path: str, force: 
     else:
         # 3) Судья (ОДНА итерация) — оцениваем исходный набор карточек
         judge_meta = _judge_once(ctx, origin_rel_path=origin_rel_path, doc_text=md_text, cards=raw_cards)
+        judge_meta = _sanitize_judge_meta(doc_text=md_text, judge_meta=judge_meta)
         quality = {"judge": judge_meta}
 
         # 4) Если судья говорит "не ок" — ОБЯЗАТЕЛЬНО один раз добиваем писателем, без повторного вызова судьи
@@ -530,10 +519,6 @@ def kb_upsert_cards_for_markdown(ctx: ToolContext, origin_rel_path: str, force: 
                 quality["refinement_error"] = f"{type(e).__name__}"
         else:
             quality["refinement_applied"] = False
-
-        # 5) Финальный post-process: если получилось слишком много — объединяем в обзорную
-        if _should_merge_to_overview(origin_rel_path, md_text, raw_cards):
-            raw_cards = _merge_cards_to_overview(origin_rel_path, raw_cards)
 
     md_dir = ctx.kb.cards_md_dir
     md_dir.mkdir(parents=True, exist_ok=True)
